@@ -96,6 +96,14 @@ assert.equal(context.formatBarText(atDhuhr, initialRelativeSettings), "D now");
 assert.equal(context.formatBarText(afterDhuhr, absoluteSettings), "Dhuhr 7m ago");
 assert.equal(context.formatBarText(afterDhuhr, initialRelativeSettings), "D 7m ago");
 
+const noUpcomingPrayer = context.deriveState(
+  times,
+  null,
+  Date.parse("2026-08-29T12:21:00Z"),
+);
+assert.equal(noUpcomingPrayer.nextLabel, "");
+assert.equal(context.formatBarText(noUpcomingPrayer, absoluteSettings), "--");
+
 assert.deepEqual(
   Array.from(
     [

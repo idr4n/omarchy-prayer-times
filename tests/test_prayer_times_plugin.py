@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import runpy
@@ -10,6 +11,7 @@ import tempfile
 import unittest
 from datetime import date, datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -106,6 +108,32 @@ class PrayerTimesBackendTest(unittest.TestCase):
         self.assertEqual(enabled_result["timings"]["Isha"], "19:58")
         self.assertEqual(disabled_result["timings"]["Isha"], "19:28")
 
+    def test_post_midnight_isha_rolls_forward_and_extends_payload_expiry(
+        self,
+    ) -> None:
+        day = date(2026, 6, 21)
+        zone = ZoneInfo("Europe/Helsinki")
+        day_payload = {
+            "date": day.isoformat(),
+            "timings": {
+                "Fajr": "01:22",
+                "Sunrise": "03:54",
+                "Dhuhr": "13:22",
+                "Asr": "18:04",
+                "Maghrib": "22:50",
+                "Isha": "01:22",
+            },
+        }
+
+        times = self.module["build_times"](day_payload, zone)
+
+        self.assertEqual(times[-1]["time"], "01:22")
+        self.assertEqual(times[-1]["iso"], "2026-06-22T01:22:00+03:00")
+        self.assertEqual(
+            self.module["payload_expiry"](day, zone, times),
+            "2026-06-22T01:42:00+03:00",
+        )
+
     def test_api_query_carries_school_high_latitude_and_hijri_adjustment(self) -> None:
         args = self.args(
             "--school",
@@ -162,20 +190,93 @@ class PrayerTimesBackendTest(unittest.TestCase):
                     self.module["write_settings"]('{"method":4}')
                 self.assertEqual(sentinel.read_text(), '{"safe":true}\n')
 
-    def test_automatic_location_uses_ipinfo_result_and_timezone(self) -> None:
+    def test_settings_read_creates_parent_for_file_watcher(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="prayer-settings-") as directory:
+            target = (
+                Path(directory)
+                / "missing"
+                / "omarchy"
+                / "settings"
+                / "prayer-times.json"
+            )
+
+            result = self.module["read_settings"](target)
+
+            self.assertEqual(result, "{}")
+            self.assertTrue(target.parent.is_dir())
+            self.assertEqual(stat.S_IMODE(target.parent.stat().st_mode), 0o700)
+
+    def test_settings_patch_preserves_other_instance_values(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="prayer-settings-") as directory:
+            target = Path(directory) / "prayer-times.json"
+            original = {
+                "locationMode": "manual",
+                "locationName": "Helsinki, Finland",
+                "latitude": 60.1699,
+                "longitude": 24.9384,
+                "timezone": "Europe/Helsinki",
+                "offsets": {"fajr": 2, "asr": 4},
+            }
+            self.module["write_settings"](json.dumps(original), target)
+
+            self.module["patch_settings"](
+                json.dumps({
+                    "textMode": "full-relative",
+                    "offsets": {"asr": 5},
+                }),
+                target,
+            )
+            result = json.loads(self.module["read_settings"](target))
+
+        self.assertEqual(result["locationName"], "Helsinki, Finland")
+        self.assertEqual(result["textMode"], "full-relative")
+        self.assertEqual(result["offsets"], {"fajr": 2, "asr": 5})
+
+    def test_settings_patch_command_reports_write_failures(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="prayer-settings-") as directory:
+            state_home = Path(directory) / "state"
+            target = (
+                state_home / "omarchy" / "settings" / "prayer-times.json"
+            )
+            target.parent.mkdir(parents=True)
+            sentinel = Path(directory) / "sentinel.json"
+            sentinel.write_text('{"safe":true}\n')
+            target.symlink_to(sentinel)
+
+            with (
+                patch.dict(os.environ, {"XDG_STATE_HOME": str(state_home)}),
+                patch("sys.stderr", new_callable=io.StringIO) as error,
+            ):
+                exit_code = self.module["main"](
+                    ["--patch-settings", '{"textMode":"full-relative"}']
+                )
+            error_text = error.getvalue()
+            sentinel_text = sentinel.read_text()
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("regular file", error_text)
+        self.assertEqual(sentinel_text, '{"safe":true}\n')
+
+    def test_automatic_location_uses_ipwho_over_ipv4(self) -> None:
         response = json.dumps(
             {
-                "ip": "178.73.84.80",
+                "success": True,
                 "city": "Riyadh",
-                "region": "Riyadh Region",
-                "country": "SA",
-                "loc": "24.6877,46.7219",
-                "timezone": "Asia/Riyadh",
+                "country": "Saudi Arabia",
+                "latitude": 24.6877293,
+                "longitude": 46.7218526,
+                "timezone": {"id": "Asia/Riyadh"},
             }
         )
+        requests = []
         fetch_globals = self.module["fetch_geo_location"].__globals__
         original = fetch_globals["curl_text"]
-        fetch_globals["curl_text"] = lambda url: response
+
+        def fake_curl(url: str, *, ipv4: bool = False) -> str:
+            requests.append((url, ipv4))
+            return response
+
+        fetch_globals["curl_text"] = fake_curl
         try:
             with tempfile.TemporaryDirectory(prefix="prayer-location-") as directory:
                 cache_dir = Path(directory)
@@ -186,10 +287,10 @@ class PrayerTimesBackendTest(unittest.TestCase):
         finally:
             fetch_globals["curl_text"] = original
 
-        self.assertEqual(result["locationLabel"], "Riyadh")
+        self.assertEqual(result["locationLabel"], "Riyadh, Saudi Arabia")
         self.assertEqual(result["timezone"], "Asia/Riyadh")
-        self.assertEqual(cached["provider"], "ipinfo")
-        self.assertEqual(self.module["LOCATION_URL"], "https://ipinfo.io/json")
+        self.assertEqual(cached["provider"], "ipwho-v4")
+        self.assertEqual(requests, [(self.module["LOCATION_URL"], True)])
 
     def test_location_cache_from_previous_provider_is_invalidated(self) -> None:
         with tempfile.TemporaryDirectory(prefix="prayer-location-") as directory:
@@ -199,7 +300,7 @@ class PrayerTimesBackendTest(unittest.TestCase):
                 "longitude": 42.7333332,
                 "locationLabel": "Khamis Mushait, Saudi Arabia",
                 "timezone": "Asia/Riyadh",
-                "provider": "ipwho",
+                "provider": "ipinfo",
             }))
 
             result = self.module["cached_location"](

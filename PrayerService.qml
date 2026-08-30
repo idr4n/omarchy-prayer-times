@@ -11,6 +11,8 @@ Scope {
   property var times: []
   property var tomorrow: null
   property string date: ""
+  property string dateEndsAt: ""
+  property string rolloverRefreshAttempted: ""
   property string dateText: ""
   property string timezone: ""
   property string methodName: ""
@@ -38,12 +40,15 @@ Scope {
 
   property bool loaded: false
   property bool refreshing: false
+  property bool refreshQueued: false
   property bool settingsReady: false
   property bool settingsSaving: false
   property string settingsError: ""
   property var configuration: PrayerLogic.defaultSettings()
   property string pendingSettingsPayload: ""
   property string savingSettingsPayload: ""
+  property var pendingSettingsPatch: ({})
+  property var savingSettingsPatch: ({})
 
   readonly property var methodOptions: PrayerLogic.METHOD_OPTIONS
   readonly property var schoolOptions: PrayerLogic.SCHOOL_OPTIONS
@@ -56,6 +61,11 @@ Scope {
   readonly property string configuredLocationText: configuration.locationMode === "manual"
     ? String(configuration.locationName || "")
     : "Automatic"
+  readonly property string settingsPath: {
+    var stateHome = Quickshell.env("XDG_STATE_HOME")
+    if (!stateHome) stateHome = Quickshell.env("HOME") + "/.local/state"
+    return stateHome + "/omarchy/settings/prayer-times.json"
+  }
 
   function pluginPath(name) {
     var base = Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "")
@@ -82,13 +92,6 @@ Scope {
     return args
   }
 
-  function localTodayIso() {
-    var now = new Date()
-    var year = now.getFullYear()
-    var month = String(now.getMonth() + 1).padStart(2, "0")
-    var day = String(now.getDate()).padStart(2, "0")
-    return year + "-" + month + "-" + day
-  }
 
   function formatDateText(iso) {
     if (!iso) return ""
@@ -131,15 +134,87 @@ Scope {
     retryTimer.restart()
   }
 
+  function backendConfigurationKey(config) {
+    var value = PrayerLogic.sanitizeSettings(config)
+    return JSON.stringify({
+      locationMode: value.locationMode,
+      locationName: value.locationName,
+      latitude: value.latitude,
+      longitude: value.longitude,
+      timezone: value.timezone,
+      method: value.method,
+      school: value.school,
+      highLatitude: value.highLatitude,
+      hijriAdjustment: value.hijriAdjustment,
+      ramadanIsha: value.ramadanIsha,
+      offsets: value.offsets
+    })
+  }
+
+  function mergeSettingsPatch(current, partial) {
+    var existing = current && typeof current === "object" ? current : ({})
+    var update = partial && typeof partial === "object" ? partial : ({})
+    var merged = ({})
+    var key
+    for (key in existing) merged[key] = existing[key]
+    for (key in update) merged[key] = update[key]
+    if (update.offsets) {
+      merged.offsets = ({})
+      var existingOffsets = existing.offsets && typeof existing.offsets === "object"
+        ? existing.offsets
+        : ({})
+      for (key in existingOffsets) merged.offsets[key] = existingOffsets[key]
+      for (key in update.offsets) merged.offsets[key] = update.offsets[key]
+    }
+    return merged
+  }
+
+  function applySettingsText(raw) {
+    var parsed
+    try {
+      parsed = JSON.parse(String(raw || "{}"))
+    } catch (error) {
+      root.settingsError = "Invalid saved prayer settings"
+      return
+    }
+
+    var previousKey = root.backendConfigurationKey(root.configuration)
+    var next = PrayerLogic.sanitizeSettings(parsed)
+    if (root.savingSettingsPayload)
+      next = PrayerLogic.mergeSettings(next, root.savingSettingsPatch)
+    if (root.pendingSettingsPayload)
+      next = PrayerLogic.mergeSettings(next, root.pendingSettingsPatch)
+    if (JSON.stringify(next) === JSON.stringify(root.configuration)) return
+
+    root.configuration = next
+    if (root.settingsReady
+        && previousKey !== root.backendConfigurationKey(root.configuration))
+      settingsRefreshTimer.restart()
+  }
+
+  function finishRefresh() {
+    root.refreshing = false
+    if (!root.refreshQueued) return
+    root.refreshQueued = false
+    Qt.callLater(root.refresh)
+  }
+
   function refresh() {
-    if (!root.settingsReady || root.refreshing) return
+    if (!root.settingsReady) return
+    if (root.refreshing) {
+      root.refreshQueued = true
+      return
+    }
     root.refreshing = true
     prayerProcess.exec(root.backendArguments())
   }
 
   function updateSettings(partial, refetch) {
     root.configuration = PrayerLogic.mergeSettings(root.configuration, partial)
-    root.pendingSettingsPayload = JSON.stringify(root.configuration)
+    root.pendingSettingsPatch = root.mergeSettingsPatch(
+      root.pendingSettingsPatch, partial
+    )
+    root.pendingSettingsPayload = JSON.stringify(root.pendingSettingsPatch)
     settingsSaveTimer.restart()
     if (refetch) settingsRefreshTimer.restart()
   }
@@ -175,18 +250,30 @@ Scope {
   }
 
   function beginSettingsSave() {
-    if (!root.pendingSettingsPayload) return
-    if (settingsSaveProcess.running) return
+    if (!root.pendingSettingsPayload || settingsSaveProcess.running) return
+    root.savingSettingsPatch = root.pendingSettingsPatch
     root.savingSettingsPayload = root.pendingSettingsPayload
+    root.pendingSettingsPatch = ({})
+    root.pendingSettingsPayload = ""
     root.settingsSaving = true
     settingsSaveProcess.exec([
       root.pluginPath("prayer-times-json"),
-      "--write-settings", root.savingSettingsPayload
+      "--patch-settings", root.savingSettingsPayload
     ])
   }
 
   Component.onCompleted: {
     settingsReadProcess.exec([root.pluginPath("prayer-times-json"), "--read-settings"])
+  }
+
+  FileView {
+    id: settingsFile
+    path: root.settingsReady ? root.settingsPath : ""
+    watchChanges: true
+    atomicWrites: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.applySettingsText(text())
   }
 
   Timer {
@@ -196,7 +283,14 @@ Scope {
     triggeredOnStart: true
     onTriggered: {
       root.recompute()
-      if (!root.refreshing && root.date && root.date !== root.localTodayIso()) root.refresh()
+      var expiry = Date.parse(root.dateEndsAt)
+      if (!root.refreshing
+          && isFinite(expiry)
+          && Date.now() >= expiry
+          && root.rolloverRefreshAttempted !== root.dateEndsAt) {
+        root.rolloverRefreshAttempted = root.dateEndsAt
+        root.refresh()
+      }
     }
   }
 
@@ -242,18 +336,10 @@ Scope {
     }
 
     onExited: function(exitCode) {
-      var parsed = ({})
-      if (exitCode === 0) {
-        try {
-          parsed = JSON.parse(settingsOutput.text.trim() || "{}")
-        } catch (error) {
-          root.settingsError = "Invalid saved prayer settings"
-        }
-      } else {
+      if (exitCode === 0)
+        root.applySettingsText(settingsOutput.text.trim() || "{}")
+      else
         root.settingsError = settingsReadError.text.trim() || "Unable to read prayer settings"
-      }
-      root.configuration = PrayerLogic.sanitizeSettings(parsed)
-      root.pendingSettingsPayload = JSON.stringify(root.configuration)
       root.settingsReady = true
       root.refresh()
     }
@@ -269,11 +355,18 @@ Scope {
 
     onExited: function(exitCode) {
       root.settingsSaving = false
-      if (exitCode !== 0)
+      if (exitCode !== 0) {
         root.settingsError = settingsWriteError.text.trim() || "Unable to save prayer settings"
-      else
+        root.pendingSettingsPatch = root.mergeSettingsPatch(
+          root.savingSettingsPatch, root.pendingSettingsPatch
+        )
+        root.pendingSettingsPayload = JSON.stringify(root.pendingSettingsPatch)
+      } else {
         root.settingsError = ""
-      if (root.pendingSettingsPayload !== root.savingSettingsPayload)
+      }
+      root.savingSettingsPatch = ({})
+      root.savingSettingsPayload = ""
+      if (exitCode === 0 && root.pendingSettingsPayload)
         Qt.callLater(root.beginSettingsSave)
     }
   }
@@ -292,10 +385,9 @@ Scope {
     }
 
     onExited: function(exitCode) {
-      root.refreshing = false
-
       if (exitCode !== 0) {
         root.handleFailure(prayerError.text.trim() || "Prayer backend failed")
+        root.finishRefresh()
         return
       }
 
@@ -304,12 +396,14 @@ Scope {
         payload = JSON.parse(prayerOutput.text.trim() || "{}")
       } catch (error) {
         root.handleFailure("Invalid prayer JSON")
+        root.finishRefresh()
         return
       }
 
       root.times = payload.times || []
       root.tomorrow = payload.tomorrow || null
       root.date = payload.date || ""
+      root.dateEndsAt = payload.dateEndsAt || ""
       root.dateText = root.formatDateText(root.date)
       root.timezone = payload.timezone || ""
       root.methodName = payload.methodName || ""
@@ -333,6 +427,7 @@ Scope {
 
       root.recompute()
       if (root.state === "error" || root.state === "stale") retryTimer.restart()
+      root.finishRefresh()
     }
   }
 }

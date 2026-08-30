@@ -279,7 +279,7 @@ function formatBarText(state, settings) {
     return elapsedMinutes === 0 ? current + " now" : current + " " + elapsedMinutes + "m ago"
   }
 
-  if (!state.nextLabel) return ""
+  if (!state.nextLabel) return "--"
   var next = displayName(state.nextLabel, mode)
   if (mode.indexOf("-relative") >= 0)
     return next + " in " + relativeText(state.secondsToNext)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
@@ -23,10 +24,11 @@ SOURCE = "aladhan"
 DEFAULT_METHOD = 4
 DEFAULT_SCHOOL = 0
 MAX_SETTINGS_BYTES = 64 * 1024
+POST_ADHAN_MINUTES = 20
 LOCATION_MAX_AGE = dt.timedelta(days=30)
 ALADHAN_BASE_URL = "https://api.aladhan.com/v1/timings"
-LOCATION_PROVIDER = "ipinfo"
-LOCATION_URL = "https://ipinfo.io/json"
+LOCATION_PROVIDER = "ipwho-v4"
+LOCATION_URL = "https://ipwho.is/?fields=success,city,country,latitude,longitude,timezone"
 TIME_RE = re.compile(r"(\d{1,2}):(\d{2})")
 OFFSET_KEYS = ("fajr", "sunrise", "dhuhr", "asr", "maghrib", "isha")
 DAY_ORDER = (
@@ -123,13 +125,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--cache-dir", default=str(default_cache_dir()))
     parser.add_argument("--read-settings", action="store_true")
     parser.add_argument("--write-settings")
+    parser.add_argument("--patch-settings")
     parser.add_argument("--pretty", action="store_true")
     parser.add_argument("-h", "--help", action="store_true")
     args = parser.parse_args(argv)
     if args.help:
         raise ValueError(parser.format_help().strip())
-    if args.read_settings and args.write_settings is not None:
-        raise ValueError("--read-settings and --write-settings are mutually exclusive")
+    settings_actions = sum((
+        bool(args.read_settings),
+        args.write_settings is not None,
+        args.patch_settings is not None,
+    ))
+    if settings_actions > 1:
+        raise ValueError("settings actions are mutually exclusive")
     if (args.lat is None) != (args.lon is None):
         raise ValueError("--lat and --lon must be provided together")
     if args.method not in METHOD_NAMES:
@@ -164,6 +172,7 @@ def parse_offsets(raw: str) -> dict[str, int]:
 
 def read_settings(path: Path | None = None) -> str:
     target = path or default_settings_path()
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(target, flags)
@@ -195,7 +204,9 @@ def write_settings(raw: str, path: Path | None = None) -> None:
     value = json.loads(raw)
     if not isinstance(value, dict):
         raise ValueError("settings root must be an object")
-    payload = (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    payload = (
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
         existing = target.lstat()
@@ -217,6 +228,39 @@ def write_settings(raw: str, path: Path | None = None) -> None:
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def patch_settings(raw: str, path: Path | None = None) -> None:
+    target = path or default_settings_path()
+    encoded = raw.encode("utf-8")
+    if len(encoded) > MAX_SETTINGS_BYTES:
+        raise ValueError("settings patch exceeds 64 KiB")
+    patch = json.loads(raw)
+    if not isinstance(patch, dict):
+        raise ValueError("settings patch root must be an object")
+    if "offsets" in patch and not isinstance(patch["offsets"], dict):
+        raise ValueError("settings offsets patch must be an object")
+
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+    )
+    directory = os.open(target.parent, flags)
+    try:
+        fcntl.flock(directory, fcntl.LOCK_EX)
+        current = json.loads(read_settings(target))
+        merged = dict(current)
+        merged.update(patch)
+        if "offsets" in patch:
+            offsets = current.get("offsets")
+            merged_offsets = dict(offsets) if isinstance(offsets, dict) else {}
+            merged_offsets.update(patch["offsets"])
+            merged["offsets"] = merged_offsets
+        write_settings(json.dumps(merged, ensure_ascii=False), target)
+    finally:
+        os.close(directory)
 
 
 def method_name(method: int) -> str:
@@ -359,9 +403,13 @@ def cached_location(cache_dir: Path, now: dt.datetime) -> dict[str, Any] | None:
     }
 
 
-def curl_text(url: str) -> str:
+def curl_text(url: str, *, ipv4: bool = False) -> str:
+    command = ["curl"]
+    if ipv4:
+        command.append("-4")
+    command.extend(["-fsS", "--max-time", "6", url])
     result = subprocess.run(
-        ["curl", "-fsS", "--max-time", "6", url],
+        command,
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -376,24 +424,24 @@ def curl_text(url: str) -> str:
 
 def fetch_geo_location(cache_dir: Path, now: dt.datetime) -> dict[str, Any] | None:
     try:
-        data = json.loads(curl_text(LOCATION_URL))
-        if not isinstance(data, dict):
+        data = json.loads(curl_text(LOCATION_URL, ipv4=True))
+        if not isinstance(data, dict) or data.get("success") is False:
             return None
-        coordinates = str(data["loc"]).split(",", 1)
-        if len(coordinates) != 2:
-            return None
-        latitude = float(coordinates[0])
-        longitude = float(coordinates[1])
+        latitude = float(data["latitude"])
+        longitude = float(data["longitude"])
     except (KeyError, TypeError, ValueError, json.JSONDecodeError, RuntimeError):
         return None
     city = str(data.get("city") or "").strip()
-    region = str(data.get("region") or "").strip()
+    country = str(data.get("country") or "").strip()
+    label = ", ".join(part for part in (city, country) if part)
+    timezone_value = data.get("timezone")
+    timezone_data = timezone_value if isinstance(timezone_value, dict) else {}
     payload = {
         "provider": LOCATION_PROVIDER,
         "latitude": latitude,
         "longitude": longitude,
-        "locationLabel": city or region or f"{coord_key(latitude)}, {coord_key(longitude)}",
-        "timezone": str(data.get("timezone") or "").strip(),
+        "locationLabel": label or f"{coord_key(latitude)}, {coord_key(longitude)}",
+        "timezone": str(timezone_data.get("id") or "").strip(),
         "fetchedAt": iso_datetime(now),
     }
     try:
@@ -612,10 +660,21 @@ def day_time_entry(
 def build_times(day_payload: dict[str, Any], timezone: ZoneInfo) -> list[dict[str, Any]]:
     day = dt.date.fromisoformat(str(day_payload["date"]))
     timings = day_payload["timings"]
-    return [
-        day_time_entry(day, timezone, timings, name, label, api_key, is_prayer)
-        for name, label, api_key, is_prayer in DAY_ORDER
-    ]
+    entries: list[dict[str, Any]] = []
+    entry_day = day
+    previous_minutes: int | None = None
+    for name, label, api_key, is_prayer in DAY_ORDER:
+        hour, minute = (int(part) for part in timings[api_key].split(":", 1))
+        minutes = hour * 60 + minute
+        if previous_minutes is not None and minutes < previous_minutes:
+            entry_day += dt.timedelta(days=1)
+        entries.append(
+            day_time_entry(
+                entry_day, timezone, timings, name, label, api_key, is_prayer
+            )
+        )
+        previous_minutes = minutes
+    return entries
 
 
 def build_tomorrow(
@@ -628,6 +687,20 @@ def build_tomorrow(
         day, timezone, day_payload["timings"], "fajr", "Fajr", "Fajr", True
     )
     return {"date": day.isoformat(), "fajr": fajr}
+
+
+def payload_expiry(
+    day: dt.date, timezone: ZoneInfo, times: list[dict[str, Any]]
+) -> str:
+    expiry = dt.datetime.combine(
+        day + dt.timedelta(days=1), dt.time.min, timezone
+    )
+    if times:
+        final_prayer = dt.datetime.fromisoformat(str(times[-1]["iso"]))
+        expiry = max(
+            expiry, final_prayer + dt.timedelta(minutes=POST_ADHAN_MINUTES)
+        )
+    return iso_datetime(expiry)
 
 
 def collect_day(
@@ -753,6 +826,7 @@ def collect_payload(args: argparse.Namespace) -> dict[str, Any]:
         "source": SOURCE,
         "fromCache": from_cache,
         "generatedAt": iso_datetime(now),
+        "dateEndsAt": payload_expiry(today, final_zone, times),
         "times": times,
         "hijri": today_payload.get("hijri"),
         "tomorrow": tomorrow_block,
@@ -771,9 +845,20 @@ def main(argv: list[str]) -> int:
             write_settings(args.write_settings)
             print("{}")
             return 0
+        if args.patch_settings is not None:
+            patch_settings(args.patch_settings)
+            print("{}")
+            return 0
         payload = collect_payload(args)
         pretty = bool(args.pretty)
     except Exception as error:
+        if args is not None and (
+            args.read_settings
+            or args.write_settings is not None
+            or args.patch_settings is not None
+        ):
+            print(str(error), file=sys.stderr)
+            return 1
         payload = error_payload(str(error), args)
     print(json.dumps(payload, ensure_ascii=False, indent=2 if pretty else None))
     return 0

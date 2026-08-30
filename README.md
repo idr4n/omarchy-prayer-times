@@ -77,13 +77,16 @@ adhan before advancing to the next prayer.
 Omarchy plugins run unsandboxed inside the existing shell. Prayer Times makes
 HTTPS requests to:
 
-- `ipinfo.io` for automatic city, coordinates, and timezone detection;
+- `ipwho.is` over IPv4 for automatic city, coordinates, and timezone detection;
 - `api.aladhan.com` for prayer times; and
 - `geocoding-api.open-meteo.com` only when you search for a manual city.
 
 Automatic location data is cached for 30 days. Prayer responses are cached for
 offline use. Settings are written atomically with mode `0600` and are never
 sent anywhere except as calculation parameters to AlAdhan.
+
+IP geolocation is approximate. Use manual city search when an ISP or VPN
+endpoint is mapped somewhere else.
 
 Stored files:
 
@@ -127,7 +130,7 @@ three bar placements against a current Omarchy Quattro installation.
 ## Data sources
 
 Prayer calculations are provided by [AlAdhan](https://aladhan.com/prayer-times-api),
-automatic location by [IPinfo](https://ipinfo.io/), and manual city search by
+automatic location by [IPWHOIS.io](https://ipwhois.io/), and manual city search by
 [Open-Meteo Geocoding](https://open-meteo.com/en/docs/geocoding-api).
 
 ## License
