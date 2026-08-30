@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.idr4n.prayer-times",
+  "name": "Prayer Times",
+  "version": "1.0.0",
+  "author": "Ivan Duran",
+  "license": "MIT",
+  "description": "Configurable prayer times, countdowns, and daily schedule for the Omarchy bar.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Prayer Times",
+    "description": "Next prayer status and a bar-attached daily prayer panel.",
+    "category": "Time",
+    "aliases": ["prayer", "adhan", "athan", "salah"],
+    "allowMultiple": false,
+    "defaultSection": "center"
+  }
+}

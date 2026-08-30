@@ -1,0 +1,778 @@
+#!/usr/bin/env python3
+"""Fetch and cache configured daily prayer times for the Omarchy bar plugin."""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlencode
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+sys.dont_write_bytecode = True
+
+SOURCE = "aladhan"
+DEFAULT_METHOD = 4
+DEFAULT_SCHOOL = 0
+MAX_SETTINGS_BYTES = 64 * 1024
+LOCATION_MAX_AGE = dt.timedelta(days=30)
+ALADHAN_BASE_URL = "https://api.aladhan.com/v1/timings"
+LOCATION_URL = "https://ipwho.is/"
+TIME_RE = re.compile(r"(\d{1,2}):(\d{2})")
+OFFSET_KEYS = ("fajr", "sunrise", "dhuhr", "asr", "maghrib", "isha")
+DAY_ORDER = (
+    ("fajr", "Fajr", "Fajr", True),
+    ("sunrise", "Sunrise", "Sunrise", False),
+    ("dhuhr", "Dhuhr", "Dhuhr", True),
+    ("asr", "Asr", "Asr", True),
+    ("maghrib", "Maghrib", "Maghrib", True),
+    ("isha", "Isha", "Isha", True),
+)
+METHOD_NAMES = {
+    0: "Shia Ithna-Ashari, Leva Institute, Qum",
+    1: "University of Islamic Sciences, Karachi",
+    2: "Islamic Society of North America",
+    3: "Muslim World League",
+    4: "Umm Al-Qura University, Makkah",
+    5: "Egyptian General Authority of Survey",
+    7: "Institute of Geophysics, University of Tehran",
+    8: "Gulf Region",
+    9: "Kuwait",
+    10: "Qatar",
+    11: "Majlis Ugama Islam Singapura",
+    12: "Union Organization Islamic de France",
+    13: "Diyanet İşleri Başkanlığı, Turkey",
+    14: "Spiritual Administration of Muslims of Russia",
+    15: "Moonsighting Committee Worldwide",
+    16: "Dubai",
+    17: "Jabatan Kemajuan Islam Malaysia",
+    18: "Tunisia",
+    19: "Algeria",
+    20: "Kementerian Agama Republik Indonesia",
+    21: "Morocco",
+    22: "Comunidade Islamica de Lisboa",
+    23: "Ministry of Awqaf, Jordan",
+}
+HIJRI_MONTH_NAMES = {
+    1: "Muharram",
+    2: "Safar",
+    3: "Rabi al-Awwal",
+    4: "Rabi al-Thani",
+    5: "Jumada al-Awwal",
+    6: "Jumada al-Thani",
+    7: "Rajab",
+    8: "Sha'ban",
+    9: "Ramadan",
+    10: "Shawwal",
+    11: "Dhu al-Qadah",
+    12: "Dhu al-Hijjah",
+}
+
+
+class JsonArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:  # pragma: no cover - argparse plumbing
+        raise ValueError(message)
+
+    def exit(self, status: int = 0, message: str | None = None) -> None:  # pragma: no cover
+        raise ValueError((message or "").strip() or self.format_help().strip())
+
+
+def default_cache_dir() -> Path:
+    base = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
+    return base.expanduser() / "omarchy" / "prayer-times"
+
+
+def default_settings_path() -> Path:
+    base = Path(
+        os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
+    )
+    return base.expanduser() / "omarchy" / "settings" / "prayer-times.json"
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return int(raw)
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = JsonArgumentParser(description=__doc__, add_help=False)
+    parser.add_argument("--lat", type=float)
+    parser.add_argument("--lon", type=float)
+    parser.add_argument("--location-label", default="")
+    parser.add_argument("--method", type=int, default=env_int("PRAYER_TIMES_METHOD", DEFAULT_METHOD))
+    parser.add_argument("--school", type=int, default=env_int("PRAYER_TIMES_SCHOOL", DEFAULT_SCHOOL))
+    parser.add_argument("--high-latitude", type=int, default=0)
+    parser.add_argument("--hijri-adjustment", type=int, default=0)
+    parser.add_argument("--offsets", default="{}")
+    parser.add_argument("--ramadan-isha", choices=("0", "1"), default="1")
+    parser.add_argument("--date")
+    parser.add_argument("--now")
+    parser.add_argument("--tz")
+    parser.add_argument("--no-network", action="store_true")
+    parser.add_argument("--cache-dir", default=str(default_cache_dir()))
+    parser.add_argument("--read-settings", action="store_true")
+    parser.add_argument("--write-settings")
+    parser.add_argument("--pretty", action="store_true")
+    parser.add_argument("-h", "--help", action="store_true")
+    args = parser.parse_args(argv)
+    if args.help:
+        raise ValueError(parser.format_help().strip())
+    if args.read_settings and args.write_settings is not None:
+        raise ValueError("--read-settings and --write-settings are mutually exclusive")
+    if (args.lat is None) != (args.lon is None):
+        raise ValueError("--lat and --lon must be provided together")
+    if args.method not in METHOD_NAMES:
+        raise ValueError(f"unsupported calculation method: {args.method}")
+    if args.school not in (0, 1):
+        raise ValueError("school must be 0 (standard) or 1 (Hanafi)")
+    if not 0 <= args.high_latitude <= 3:
+        raise ValueError("high-latitude rule must be between 0 and 3")
+    if not -2 <= args.hijri_adjustment <= 2:
+        raise ValueError("Hijri adjustment must be between -2 and 2")
+    args.offsets = parse_offsets(args.offsets)
+    args.ramadan_isha = args.ramadan_isha == "1"
+    return args
+
+
+def parse_offsets(raw: str) -> dict[str, int]:
+    try:
+        value = json.loads(raw or "{}")
+    except json.JSONDecodeError as error:
+        raise ValueError("offsets must be a JSON object") from error
+    if not isinstance(value, dict):
+        raise ValueError("offsets must be a JSON object")
+    offsets: dict[str, int] = {}
+    for key in OFFSET_KEYS:
+        try:
+            offset = int(value.get(key, 0))
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"invalid {key} offset") from error
+        offsets[key] = max(-15, min(15, offset))
+    return offsets
+
+
+def read_settings(path: Path | None = None) -> str:
+    target = path or default_settings_path()
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(target, flags)
+    except FileNotFoundError:
+        return "{}"
+    except OSError:
+        return "{}"
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_SETTINGS_BYTES:
+            return "{}"
+        raw = os.read(descriptor, MAX_SETTINGS_BYTES + 1)
+        if len(raw) > MAX_SETTINGS_BYTES:
+            return "{}"
+        text = raw.decode("utf-8")
+        value = json.loads(text)
+        return json.dumps(value, ensure_ascii=False) if isinstance(value, dict) else "{}"
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return "{}"
+    finally:
+        os.close(descriptor)
+
+
+def write_settings(raw: str, path: Path | None = None) -> None:
+    target = path or default_settings_path()
+    encoded = raw.encode("utf-8")
+    if len(encoded) > MAX_SETTINGS_BYTES:
+        raise ValueError("settings exceed 64 KiB")
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("settings root must be an object")
+    payload = (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        existing = target.lstat()
+    except FileNotFoundError:
+        existing = None
+    if existing is not None and not stat.S_ISREG(existing.st_mode):
+        raise ValueError("settings target must be a regular file")
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", dir=target.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def method_name(method: int) -> str:
+    return METHOD_NAMES.get(method, f"AlAdhan method {method}")
+
+
+def iso_datetime(value: dt.datetime) -> str:
+    return value.isoformat(timespec="seconds")
+
+
+def coord_key(value: float) -> str:
+    text = f"{float(value):.6f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def tz_key(value: str | None) -> str:
+    text = str(value or "auto").strip() or "auto"
+    return "".join(char if char.isalnum() or char in (".", "_", "-", "+") else "_" for char in text)
+
+
+def config_key(args: argparse.Namespace) -> str:
+    payload = {
+        "method": args.method,
+        "school": args.school,
+        "highLatitude": args.high_latitude,
+        "hijriAdjustment": args.hijri_adjustment,
+        "ramadanIsha": args.ramadan_isha,
+        "offsets": args.offsets,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()[:12]
+
+
+def cache_path(
+    cache_dir: Path,
+    day: dt.date,
+    lat: float,
+    lon: float,
+    variant: str,
+    timezone: str | None,
+) -> Path:
+    return cache_dir / f"{day.isoformat()}-{coord_key(lat)}-{coord_key(lon)}-{variant}-{tz_key(timezone)}.json"
+
+
+def read_json_file(path: Path) -> dict[str, Any] | None:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+        handle.write("\n")
+    temporary.replace(path)
+
+
+def parse_date(value: str | None, fallback: dt.date) -> dt.date:
+    return dt.date.fromisoformat(value) if value else fallback
+
+
+def localtime_tz_name() -> str | None:
+    path = Path("/etc/localtime")
+    try:
+        target = path.resolve(strict=True)
+    except OSError:
+        return None
+    marker = "/zoneinfo/"
+    text = str(target)
+    return text.split(marker, 1)[1] if marker in text else None
+
+
+def zone_for_name(name: str | None) -> ZoneInfo | None:
+    return ZoneInfo(name) if name else None
+
+
+def parse_now(value: str | None, zone: ZoneInfo | None) -> dt.datetime:
+    if value:
+        parsed = dt.datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=zone) if zone is not None else parsed.astimezone()
+        return parsed.astimezone(zone) if zone is not None else parsed
+    return dt.datetime.now(zone) if zone is not None else dt.datetime.now().astimezone()
+
+
+def error_payload(
+    message: str,
+    args: argparse.Namespace | None = None,
+    now: dt.datetime | None = None,
+) -> dict[str, Any]:
+    method = int(getattr(args, "method", DEFAULT_METHOD)) if args is not None else DEFAULT_METHOD
+    school = int(getattr(args, "school", DEFAULT_SCHOOL)) if args is not None else DEFAULT_SCHOOL
+    current = now or dt.datetime.now().astimezone()
+    return {
+        "state": "error",
+        "error": message,
+        "date": current.date().isoformat(),
+        "timezone": str(getattr(current.tzinfo, "key", "") or current.tzname() or ""),
+        "method": method,
+        "methodName": method_name(method),
+        "school": school,
+        "latitude": None,
+        "longitude": None,
+        "locationLabel": "",
+        "source": SOURCE,
+        "fromCache": False,
+        "generatedAt": iso_datetime(current),
+        "times": [],
+        "hijri": None,
+        "tomorrow": None,
+    }
+
+
+def cached_location(cache_dir: Path, now: dt.datetime) -> dict[str, Any] | None:
+    path = cache_dir / "location.json"
+    payload = read_json_file(path)
+    if not payload:
+        return None
+    try:
+        modified = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=now.tzinfo)
+        latitude = float(payload["latitude"])
+        longitude = float(payload["longitude"])
+    except (OSError, KeyError, TypeError, ValueError):
+        return None
+    if now - modified >= LOCATION_MAX_AGE:
+        return None
+    label = str(payload.get("locationLabel") or f"{coord_key(latitude)}, {coord_key(longitude)}").strip()
+    return {
+        "latitude": latitude,
+        "longitude": longitude,
+        "locationLabel": label,
+        "timezone": str(payload.get("timezone") or "").strip(),
+    }
+
+
+def curl_text(url: str) -> str:
+    result = subprocess.run(
+        ["curl", "-fsS", "--max-time", "6", url],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=8,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        raise RuntimeError(detail or f"curl exited {result.returncode}")
+    return result.stdout.strip()
+
+
+def fetch_geo_location(cache_dir: Path, now: dt.datetime) -> dict[str, Any] | None:
+    try:
+        data = json.loads(curl_text(LOCATION_URL))
+        if not isinstance(data, dict) or data.get("success") is False:
+            return None
+        latitude = float(data["latitude"])
+        longitude = float(data["longitude"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError, RuntimeError):
+        return None
+    city = str(data.get("city") or "").strip()
+    country = str(data.get("country") or "").strip()
+    label = ", ".join(part for part in (city, country) if part)
+    timezone_data = data.get("timezone") if isinstance(data.get("timezone"), dict) else {}
+    payload = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "locationLabel": label or f"{coord_key(latitude)}, {coord_key(longitude)}",
+        "timezone": str(timezone_data.get("id") or "").strip(),
+        "fetchedAt": iso_datetime(now),
+    }
+    try:
+        write_json_file(cache_dir / "location.json", payload)
+    except OSError:
+        pass
+    return payload
+
+
+def resolve_location(
+    args: argparse.Namespace, cache_dir: Path, now: dt.datetime
+) -> dict[str, Any] | None:
+    if args.lat is not None and args.lon is not None:
+        latitude = float(args.lat)
+        longitude = float(args.lon)
+        if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+            raise ValueError("coordinates are out of range")
+        return {
+            "latitude": latitude,
+            "longitude": longitude,
+            "locationLabel": str(args.location_label or f"{coord_key(latitude)}, {coord_key(longitude)}").strip(),
+            "timezone": str(args.tz or "").strip(),
+        }
+    location = cached_location(cache_dir, now)
+    if location:
+        return location
+    return fetch_geo_location(cache_dir, now) if not args.no_network else None
+
+
+def normalize_time(value: Any) -> str:
+    match = TIME_RE.search(str(value or ""))
+    if not match:
+        raise ValueError(f"missing prayer time in {value!r}")
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"invalid prayer time {value!r}")
+    return f"{hour:02d}:{minute:02d}"
+
+
+def shifted_time(value: str, minutes: int) -> str:
+    hour, minute = (int(part) for part in value.split(":", 1))
+    total = (hour * 60 + minute + minutes) % (24 * 60)
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def apply_calculation_adjustments(
+    timings: dict[str, str],
+    hijri: dict[str, Any] | None,
+    args: argparse.Namespace,
+) -> dict[str, str]:
+    adjusted = dict(timings)
+    if args.method == 4:
+        ramadan = bool(hijri and hijri.get("monthNumber") == 9)
+        isha_delay = 120 if args.ramadan_isha and ramadan else 90
+        adjusted["Isha"] = shifted_time(adjusted["Maghrib"], isha_delay)
+    for setting_key, _name, api_key, _is_prayer in DAY_ORDER:
+        adjusted[api_key] = shifted_time(adjusted[api_key], args.offsets[setting_key])
+    return adjusted
+
+
+def normalize_aladhan(
+    payload: dict[str, Any],
+    day: dt.date,
+    lat: float,
+    lon: float,
+    args: argparse.Namespace,
+    variant: str,
+) -> dict[str, Any]:
+    data = payload.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("timings"), dict):
+        raise ValueError("AlAdhan response missing timings")
+    timings = data["timings"]
+    meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+    hijri = None
+    try:
+        hijri_payload = data["date"]["hijri"]
+        month_number = int(hijri_payload["month"]["number"])
+        hijri = {
+            "day": int(hijri_payload["day"]),
+            "month": HIJRI_MONTH_NAMES.get(month_number, ""),
+            "monthNumber": month_number,
+            "year": int(hijri_payload["year"]),
+            "designation": str(hijri_payload.get("designation", {}).get("abbreviated") or "AH"),
+        }
+    except (AttributeError, KeyError, TypeError, ValueError):
+        hijri = None
+    normalized = {
+        api_key: normalize_time(timings.get(api_key))
+        for _setting, _name, api_key, _prayer in DAY_ORDER
+    }
+    normalized = apply_calculation_adjustments(normalized, hijri, args)
+    return {
+        "source": SOURCE,
+        "date": day.isoformat(),
+        "latitude": float(lat),
+        "longitude": float(lon),
+        "method": int(args.method),
+        "methodName": method_name(args.method),
+        "school": int(args.school),
+        "timezone": str(meta.get("timezone") or "").strip(),
+        "timings": normalized,
+        "hijri": hijri,
+        "variant": variant,
+    }
+
+
+def fetch_day(
+    day: dt.date,
+    lat: float,
+    lon: float,
+    args: argparse.Namespace,
+    timezone: str | None,
+    variant: str,
+) -> dict[str, Any]:
+    query: dict[str, str] = {
+        "latitude": coord_key(lat),
+        "longitude": coord_key(lon),
+        "method": str(args.method),
+        "school": str(args.school),
+        "adjustment": str(args.hijri_adjustment),
+    }
+    high_latitude_map = {1: 3, 2: 2, 3: 1}
+    if args.high_latitude in high_latitude_map:
+        query["latitudeAdjustmentMethod"] = str(high_latitude_map[args.high_latitude])
+    if timezone:
+        query["timezonestring"] = timezone
+    url = f"{ALADHAN_BASE_URL}/{day.strftime('%d-%m-%Y')}?{urlencode(query)}"
+    payload = json.loads(curl_text(url))
+    if not isinstance(payload, dict):
+        raise ValueError("AlAdhan response was not an object")
+    return normalize_aladhan(payload, day, lat, lon, args, variant)
+
+
+def validate_cached_day(
+    payload: dict[str, Any], day: dt.date, variant: str
+) -> dict[str, Any] | None:
+    try:
+        if str(payload.get("date")) != day.isoformat() or payload.get("variant") != variant:
+            return None
+        timings = payload.get("timings")
+        if not isinstance(timings, dict):
+            return None
+        normalized = {
+            api_key: normalize_time(timings.get(api_key))
+            for _setting, _name, api_key, _prayer in DAY_ORDER
+        }
+        latitude = float(payload["latitude"])
+        longitude = float(payload["longitude"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return {
+        **payload,
+        "date": day.isoformat(),
+        "latitude": latitude,
+        "longitude": longitude,
+        "timings": normalized,
+        "variant": variant,
+    }
+
+
+def cached_day_candidates(
+    cache_dir: Path,
+    day: dt.date,
+    lat: float | None,
+    lon: float | None,
+    variant: str,
+    timezone: str | None,
+) -> list[Path]:
+    if lat is not None and lon is not None and timezone:
+        return [cache_path(cache_dir, day, lat, lon, variant, timezone)]
+    latitude = coord_key(lat) if lat is not None else "*"
+    longitude = coord_key(lon) if lon is not None else "*"
+    timezone_part = tz_key(timezone) if timezone else "*"
+    paths = list(cache_dir.glob(f"{day.isoformat()}-{latitude}-{longitude}-{variant}-{timezone_part}.json"))
+    paths.sort(key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True)
+    return paths
+
+
+def load_cached_day(
+    cache_dir: Path,
+    day: dt.date,
+    lat: float | None,
+    lon: float | None,
+    variant: str,
+    timezone: str | None,
+) -> dict[str, Any] | None:
+    for path in cached_day_candidates(cache_dir, day, lat, lon, variant, timezone):
+        payload = read_json_file(path)
+        normalized = validate_cached_day(payload, day, variant) if payload else None
+        if normalized is not None:
+            return normalized
+    return None
+
+
+def day_time_entry(
+    day: dt.date,
+    timezone: ZoneInfo,
+    timings: dict[str, str],
+    name: str,
+    label: str,
+    api_key: str,
+    is_prayer: bool,
+) -> dict[str, Any]:
+    hour, minute = (int(part) for part in timings[api_key].split(":", 1))
+    local = dt.datetime.combine(day, dt.time(hour, minute), timezone)
+    return {
+        "name": name,
+        "label": label,
+        "time": f"{hour:02d}:{minute:02d}",
+        "iso": iso_datetime(local),
+        "isPrayer": is_prayer,
+    }
+
+
+def build_times(day_payload: dict[str, Any], timezone: ZoneInfo) -> list[dict[str, Any]]:
+    day = dt.date.fromisoformat(str(day_payload["date"]))
+    timings = day_payload["timings"]
+    return [
+        day_time_entry(day, timezone, timings, name, label, api_key, is_prayer)
+        for name, label, api_key, is_prayer in DAY_ORDER
+    ]
+
+
+def build_tomorrow(
+    day_payload: dict[str, Any] | None, timezone: ZoneInfo
+) -> dict[str, Any] | None:
+    if day_payload is None:
+        return None
+    day = dt.date.fromisoformat(str(day_payload["date"]))
+    fajr = day_time_entry(
+        day, timezone, day_payload["timings"], "fajr", "Fajr", "Fajr", True
+    )
+    return {"date": day.isoformat(), "fajr": fajr}
+
+
+def collect_day(
+    cache_dir: Path,
+    day: dt.date,
+    lat: float,
+    lon: float,
+    args: argparse.Namespace,
+    timezone: str | None,
+    variant: str,
+) -> tuple[dict[str, Any] | None, bool]:
+    if not args.no_network:
+        try:
+            payload = fetch_day(day, lat, lon, args, timezone, variant)
+            cache_timezone = payload.get("timezone") or timezone or "auto"
+            try:
+                write_json_file(
+                    cache_path(cache_dir, day, lat, lon, variant, cache_timezone), payload
+                )
+            except OSError:
+                pass
+            return payload, False
+        except Exception:
+            pass
+    cached = load_cached_day(cache_dir, day, lat, lon, variant, timezone)
+    return cached, cached is not None
+
+
+def collect_payload(args: argparse.Namespace) -> dict[str, Any]:
+    cache_dir = Path(args.cache_dir).expanduser()
+    local_now = parse_now(args.now, None)
+    location = resolve_location(args, cache_dir, local_now)
+    configured_timezone = str(args.tz or os.environ.get("PRAYER_TIMES_TZ") or "").strip()
+    location_timezone = str(location.get("timezone") or "").strip() if location else ""
+    initial_tz_name = configured_timezone or location_timezone or localtime_tz_name()
+    initial_zone = zone_for_name(initial_tz_name) if initial_tz_name else None
+    provisional_now = parse_now(args.now, initial_zone)
+    today = parse_date(args.date, provisional_now.date())
+    tomorrow = today + dt.timedelta(days=1)
+    variant = config_key(args)
+
+    if location is None:
+        today_cache = load_cached_day(cache_dir, today, None, None, variant, initial_tz_name)
+        if today_cache is None:
+            return error_payload("location unavailable and no cached prayer times found", args, provisional_now)
+        latitude = float(today_cache["latitude"])
+        longitude = float(today_cache["longitude"])
+        label = f"{coord_key(latitude)}, {coord_key(longitude)}"
+        today_payload, today_from_cache = today_cache, True
+        tomorrow_payload = load_cached_day(
+            cache_dir,
+            tomorrow,
+            latitude,
+            longitude,
+            variant,
+            today_cache.get("timezone") or initial_tz_name,
+        )
+        tomorrow_from_cache = tomorrow_payload is not None
+    else:
+        latitude = float(location["latitude"])
+        longitude = float(location["longitude"])
+        label = str(location.get("locationLabel") or f"{coord_key(latitude)}, {coord_key(longitude)}")
+        today_payload, today_from_cache = collect_day(
+            cache_dir, today, latitude, longitude, args, initial_tz_name, variant
+        )
+        if today_payload and not initial_tz_name and today_payload.get("timezone"):
+            initial_tz_name = str(today_payload["timezone"])
+        tomorrow_payload, tomorrow_from_cache = collect_day(
+            cache_dir, tomorrow, latitude, longitude, args, initial_tz_name, variant
+        )
+
+    if today_payload is None:
+        return {
+            **error_payload("today's prayer times unavailable", args, provisional_now),
+            "date": today.isoformat(),
+            "timezone": initial_tz_name or "",
+            "latitude": latitude,
+            "longitude": longitude,
+            "locationLabel": label,
+        }
+
+    final_tz_name = str(today_payload.get("timezone") or initial_tz_name or "").strip()
+    if not final_tz_name and tomorrow_payload is not None:
+        final_tz_name = str(tomorrow_payload.get("timezone") or "").strip()
+    if not final_tz_name:
+        return {
+            **error_payload("timezone unavailable", args, provisional_now),
+            "date": today.isoformat(),
+            "latitude": latitude,
+            "longitude": longitude,
+            "locationLabel": label,
+        }
+    try:
+        final_zone = ZoneInfo(final_tz_name)
+    except ZoneInfoNotFoundError:
+        return {
+            **error_payload(f"timezone unavailable: {final_tz_name}", args, provisional_now),
+            "date": today.isoformat(),
+            "timezone": final_tz_name,
+            "latitude": latitude,
+            "longitude": longitude,
+            "locationLabel": label,
+        }
+
+    now = parse_now(args.now, final_zone)
+    times = build_times(today_payload, final_zone)
+    tomorrow_block = build_tomorrow(tomorrow_payload, final_zone)
+    today_fresh = not today_from_cache
+    tomorrow_available = tomorrow_payload is not None
+    state = "ok" if today_fresh and tomorrow_available else "stale"
+    from_cache = (not today_fresh) or (not tomorrow_available)
+    return {
+        "state": state,
+        "error": "",
+        "date": today.isoformat(),
+        "timezone": final_tz_name,
+        "method": args.method,
+        "methodName": method_name(args.method),
+        "school": args.school,
+        "latitude": latitude,
+        "longitude": longitude,
+        "locationLabel": label,
+        "source": SOURCE,
+        "fromCache": from_cache,
+        "generatedAt": iso_datetime(now),
+        "times": times,
+        "hijri": today_payload.get("hijri"),
+        "tomorrow": tomorrow_block,
+    }
+
+
+def main(argv: list[str]) -> int:
+    args: argparse.Namespace | None = None
+    pretty = "--pretty" in argv
+    try:
+        args = parse_args(argv)
+        if args.read_settings:
+            print(read_settings())
+            return 0
+        if args.write_settings is not None:
+            write_settings(args.write_settings)
+            print("{}")
+            return 0
+        payload = collect_payload(args)
+        pretty = bool(args.pretty)
+    except Exception as error:
+        payload = error_payload(str(error), args)
+    print(json.dumps(payload, ensure_ascii=False, indent=2 if pretty else None))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
