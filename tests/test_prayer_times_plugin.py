@@ -162,15 +162,15 @@ class PrayerTimesBackendTest(unittest.TestCase):
                     self.module["write_settings"]('{"method":4}')
                 self.assertEqual(sentinel.read_text(), '{"safe":true}\n')
 
-    def test_automatic_location_uses_https_result_and_timezone(self) -> None:
+    def test_automatic_location_uses_ipinfo_result_and_timezone(self) -> None:
         response = json.dumps(
             {
-                "success": True,
+                "ip": "178.73.84.80",
                 "city": "Riyadh",
-                "country": "Saudi Arabia",
-                "latitude": 24.7136,
-                "longitude": 46.6753,
-                "timezone": {"id": "Asia/Riyadh"},
+                "region": "Riyadh Region",
+                "country": "SA",
+                "loc": "24.6877,46.7219",
+                "timezone": "Asia/Riyadh",
             }
         )
         fetch_globals = self.module["fetch_geo_location"].__globals__
@@ -178,15 +178,35 @@ class PrayerTimesBackendTest(unittest.TestCase):
         fetch_globals["curl_text"] = lambda url: response
         try:
             with tempfile.TemporaryDirectory(prefix="prayer-location-") as directory:
+                cache_dir = Path(directory)
                 result = self.module["fetch_geo_location"](
-                    Path(directory), datetime(2026, 8, 30, tzinfo=timezone.utc)
+                    cache_dir, datetime(2026, 8, 30, tzinfo=timezone.utc)
                 )
+                cached = json.loads((cache_dir / "location.json").read_text())
         finally:
             fetch_globals["curl_text"] = original
 
-        self.assertEqual(result["locationLabel"], "Riyadh, Saudi Arabia")
+        self.assertEqual(result["locationLabel"], "Riyadh")
         self.assertEqual(result["timezone"], "Asia/Riyadh")
-        self.assertEqual(self.module["LOCATION_URL"], "https://ipwho.is/")
+        self.assertEqual(cached["provider"], "ipinfo")
+        self.assertEqual(self.module["LOCATION_URL"], "https://ipinfo.io/json")
+
+    def test_location_cache_from_previous_provider_is_invalidated(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="prayer-location-") as directory:
+            cache_dir = Path(directory)
+            (cache_dir / "location.json").write_text(json.dumps({
+                "latitude": 18.2949297,
+                "longitude": 42.7333332,
+                "locationLabel": "Khamis Mushait, Saudi Arabia",
+                "timezone": "Asia/Riyadh",
+                "provider": "ipwho",
+            }))
+
+            result = self.module["cached_location"](
+                cache_dir, datetime.now(timezone.utc)
+            )
+
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":

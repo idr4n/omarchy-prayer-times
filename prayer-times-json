@@ -25,7 +25,8 @@ DEFAULT_SCHOOL = 0
 MAX_SETTINGS_BYTES = 64 * 1024
 LOCATION_MAX_AGE = dt.timedelta(days=30)
 ALADHAN_BASE_URL = "https://api.aladhan.com/v1/timings"
-LOCATION_URL = "https://ipwho.is/"
+LOCATION_PROVIDER = "ipinfo"
+LOCATION_URL = "https://ipinfo.io/json"
 TIME_RE = re.compile(r"(\d{1,2}):(\d{2})")
 OFFSET_KEYS = ("fajr", "sunrise", "dhuhr", "asr", "maghrib", "isha")
 DAY_ORDER = (
@@ -339,6 +340,8 @@ def cached_location(cache_dir: Path, now: dt.datetime) -> dict[str, Any] | None:
     payload = read_json_file(path)
     if not payload:
         return None
+    if payload.get("provider") != LOCATION_PROVIDER:
+        return None
     try:
         modified = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=now.tzinfo)
         latitude = float(payload["latitude"])
@@ -374,21 +377,23 @@ def curl_text(url: str) -> str:
 def fetch_geo_location(cache_dir: Path, now: dt.datetime) -> dict[str, Any] | None:
     try:
         data = json.loads(curl_text(LOCATION_URL))
-        if not isinstance(data, dict) or data.get("success") is False:
+        if not isinstance(data, dict):
             return None
-        latitude = float(data["latitude"])
-        longitude = float(data["longitude"])
+        coordinates = str(data["loc"]).split(",", 1)
+        if len(coordinates) != 2:
+            return None
+        latitude = float(coordinates[0])
+        longitude = float(coordinates[1])
     except (KeyError, TypeError, ValueError, json.JSONDecodeError, RuntimeError):
         return None
     city = str(data.get("city") or "").strip()
-    country = str(data.get("country") or "").strip()
-    label = ", ".join(part for part in (city, country) if part)
-    timezone_data = data.get("timezone") if isinstance(data.get("timezone"), dict) else {}
+    region = str(data.get("region") or "").strip()
     payload = {
+        "provider": LOCATION_PROVIDER,
         "latitude": latitude,
         "longitude": longitude,
-        "locationLabel": label or f"{coord_key(latitude)}, {coord_key(longitude)}",
-        "timezone": str(timezone_data.get("id") or "").strip(),
+        "locationLabel": city or region or f"{coord_key(latitude)}, {coord_key(longitude)}",
+        "timezone": str(data.get("timezone") or "").strip(),
         "fetchedAt": iso_datetime(now),
     }
     try:

@@ -77,7 +77,9 @@ BarWidget {
     bar: root.bar
     text: root.statusText
     active: prayer.withinFlash || prayer.state === "error"
-    tooltipText: "Prayer Times · Right-click to change format"
+    tooltipText: prayer.locationLabel
+      ? "Prayer Times · " + prayer.locationLabel + " · Right-click to change format"
+      : "Prayer Times · Right-click to change format"
 
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.LeftButton) root.togglePanel()
