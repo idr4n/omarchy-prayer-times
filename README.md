@@ -123,6 +123,11 @@ qmllint -I "${OMARCHY_PATH:-/usr/share/omarchy}/shell" \
 omarchy plugin validate .
 ```
 
+Panel hover suppression must use `bar.setCenterHoverRevealSuppressed(...)`;
+the current Omarchy plugin bar API exposes the corresponding state as read-only.
+After shell updates, verify shortcut opening, repeated toggling, Escape,
+outside-click dismissal, and closing from settings against the live shell.
+
 Before release, also exercise automatic and manual locations, every bar text
 format, settings persistence, offline cache fallback, shell restart, and all
 three bar placements against a current Omarchy Quattro installation.
