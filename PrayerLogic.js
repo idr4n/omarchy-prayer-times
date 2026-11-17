@@ -6,6 +6,8 @@ var ELAPSED = 1200
 var WAKE_GAP_MS = 120000
 
 var TEXT_MODES = ["full-time", "full-relative", "initial-time", "initial-relative"]
+var VERTICAL_TEXT_MODES = ["time", "relative", "icon"]
+var CRESCENT_ICON = String.fromCodePoint(0xF0979)  // nf-md-star-crescent
 var OFFSET_KEYS = ["fajr", "sunrise", "dhuhr", "asr", "maghrib", "isha"]
 
 var METHOD_OPTIONS = [
@@ -51,6 +53,12 @@ var TEXT_MODE_OPTIONS = [
   { value: "full-relative", label: "Asr in 3m" },
   { value: "initial-time", label: "A 15:24" },
   { value: "initial-relative", label: "A in 3m" }
+]
+
+var VERTICAL_TEXT_MODE_OPTIONS = [
+  { value: "time", label: "Time · M 17 05" },
+  { value: "relative", label: "Countdown · M 9m" },
+  { value: "icon", label: "Icon only" }
 ]
 
 function clockJumped(previousMs, nowMs) {
@@ -193,7 +201,8 @@ function defaultSettings() {
     ramadanIsha: true,
     offsets: defaultOffsets(),
     showIcon: false,
-    textMode: "initial-time"
+    textMode: "initial-time",
+    verticalTextMode: ""
   }
 }
 
@@ -214,6 +223,12 @@ function supportedMethod(value) {
 function supportedTextMode(value) {
   var text = String(value || "")
   return TEXT_MODES.indexOf(text) >= 0 ? text : "initial-time"
+}
+
+// "" means the vertical bar follows the horizontal textMode.
+function supportedVerticalTextMode(value) {
+  var text = String(value || "")
+  return VERTICAL_TEXT_MODES.indexOf(text) >= 0 ? text : ""
 }
 
 function sanitizeSettings(value) {
@@ -244,7 +259,8 @@ function sanitizeSettings(value) {
     ramadanIsha: input.ramadanIsha === undefined ? defaults.ramadanIsha : !!input.ramadanIsha,
     offsets: offsets,
     showIcon: input.showIcon === undefined ? defaults.showIcon : !!input.showIcon,
-    textMode: supportedTextMode(input.textMode)
+    textMode: supportedTextMode(input.textMode),
+    verticalTextMode: supportedVerticalTextMode(input.verticalTextMode)
   }
 }
 
@@ -269,6 +285,17 @@ function nextTextMode(mode) {
   return TEXT_MODES[(current + 1) % TEXT_MODES.length]
 }
 
+function effectiveVerticalTextMode(settings) {
+  var config = sanitizeSettings(settings)
+  if (config.verticalTextMode) return config.verticalTextMode
+  return config.textMode.indexOf("-relative") >= 0 ? "relative" : "time"
+}
+
+function nextVerticalTextMode(mode) {
+  var current = VERTICAL_TEXT_MODES.indexOf(supportedVerticalTextMode(mode))
+  return VERTICAL_TEXT_MODES[(current + 1) % VERTICAL_TEXT_MODES.length]
+}
+
 function displayName(label, mode) {
   var value = String(label || "")
   return mode.indexOf("initial-") === 0 && value ? value.charAt(0).toUpperCase() : value
@@ -283,8 +310,8 @@ function formatBarText(state, settings) {
 
   if (state.withinElapsed && state.currentLabel) {
     var current = displayName(state.currentLabel, mode)
-    var elapsedMinutes = Math.floor(Math.max(0, state.secondsSinceAdhan) / 60)
-    return elapsedMinutes === 0 ? current + " now" : current + " " + elapsedMinutes + "m ago"
+    var minutes = elapsedMinutes(state)
+    return minutes === 0 ? current + " now" : current + " " + minutes + "m ago"
   }
 
   if (!state.nextLabel) return "--"
@@ -292,4 +319,67 @@ function formatBarText(state, settings) {
   if (mode.indexOf("-relative") >= 0)
     return next + " in " + relativeText(state.secondsToNext)
   return state.nextTime ? next + " " + state.nextTime : next
+}
+
+function elapsedMinutes(state) {
+  return Math.floor(Math.max(0, state.secondsSinceAdhan) / 60)
+}
+
+// One short row per bar slot for a left or right bar, where a widget is only
+// as wide as an icon.
+function verticalBarLines(state, settings) {
+  if (!state) return []
+  var config = sanitizeSettings(settings)
+  var mode = effectiveVerticalTextMode(config)
+  if (mode === "icon") return [CRESCENT_ICON]
+
+  var lines
+  if (state.state === "error") {
+    lines = ["--"]
+  } else if (state.withinElapsed && state.currentLabel) {
+    var current = displayName(state.currentLabel, "initial-time")
+    var minutes = elapsedMinutes(state)
+    lines = minutes === 0 ? [current, "now"] : [current, minutes + "m", "ago"]
+  } else if (!state.nextLabel) {
+    lines = ["--"]
+  } else {
+    var source = mode === "relative"
+      ? relativeText(state.secondsToNext).split(" ")
+      : String(state.nextTime || "").split(":")
+    lines = [displayName(state.nextLabel, "initial-time")].concat(
+      source.filter(function(part) { return part !== "" })
+    )
+  }
+  return config.showIcon ? [CRESCENT_ICON].concat(lines) : lines
+}
+
+// The full status in words, for a tooltip beside an abbreviated label.
+function statusText(state) {
+  if (!state) return ""
+  if (state.state === "error") return "Prayer data unavailable"
+
+  if (state.withinElapsed && state.currentLabel) {
+    var minutes = elapsedMinutes(state)
+    return minutes === 0
+      ? state.currentLabel + " now"
+      : state.currentLabel + " " + minutes + "m ago"
+  }
+
+  if (!state.nextLabel) return ""
+  var text = state.nextLabel
+  var relative = relativeText(state.secondsToNext)
+  if (relative) text += " in " + relative
+  if (state.nextTime) text += " (" + state.nextTime + ")"
+  return text
+}
+
+function barTooltipText(state, locationLabel, vertical) {
+  var parts = ["Prayer Times"]
+  if (vertical) {
+    var status = statusText(state)
+    if (status) parts.push(status)
+  }
+  if (locationLabel) parts.push(String(locationLabel))
+  parts.push("Right-click to change format")
+  return parts.join(" · ")
 }

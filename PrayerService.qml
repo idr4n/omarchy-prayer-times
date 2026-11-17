@@ -56,10 +56,15 @@ Scope {
   readonly property var schoolOptions: PrayerLogic.SCHOOL_OPTIONS
   readonly property var highLatitudeOptions: PrayerLogic.HIGH_LATITUDE_OPTIONS
   readonly property var textModeOptions: PrayerLogic.TEXT_MODE_OPTIONS
+  readonly property var verticalTextModeOptions: PrayerLogic.VERTICAL_TEXT_MODE_OPTIONS
   readonly property var offsetKeys: PrayerLogic.OFFSET_KEYS
   readonly property bool showIcon: !!configuration.showIcon
   readonly property string textMode: String(configuration.textMode || "initial-time")
   readonly property string displayText: PrayerLogic.formatBarText(root, configuration)
+  readonly property string verticalTextMode: PrayerLogic.effectiveVerticalTextMode(configuration)
+  readonly property var verticalLines: PrayerLogic.verticalBarLines(root, configuration)
+  readonly property string tooltipText: PrayerLogic.barTooltipText(root, root.locationLabel, false)
+  readonly property string verticalTooltipText: PrayerLogic.barTooltipText(root, root.locationLabel, true)
   readonly property string configuredLocationText: configuration.locationMode === "manual"
     ? String(configuration.locationName || "")
     : "Automatic"
@@ -256,6 +261,12 @@ Scope {
 
   function cycleTextMode() {
     root.updateSettings({ textMode: PrayerLogic.nextTextMode(root.textMode) }, false)
+  }
+
+  function cycleVerticalTextMode() {
+    root.updateSettings({
+      verticalTextMode: PrayerLogic.nextVerticalTextMode(root.verticalTextMode)
+    }, false)
   }
 
   function beginSettingsSave() {

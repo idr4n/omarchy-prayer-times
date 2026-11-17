@@ -2,8 +2,7 @@
 
 A configurable prayer-time bar widget and daily schedule for Omarchy Quattro.
 It detects your location automatically by default, caches prayer data for
-offline use, and follows the widget when you place it on the left, center, or
-right side of the bar.
+offline use, and works on a top, bottom, left, or right bar.
 
 ![Prayer Times panel](preview.png)
 
@@ -14,10 +13,11 @@ right side of the bar.
 - Calculation method, madhab, high-latitude rule, Ramadan Isha adjustment,
   Hijri date adjustment, and per-prayer minute offsets
 - Four bar formats: `Asr 15:24`, `Asr in 3m`, `A 15:24`, and `A in 3m`
+- Three stacked formats for a left or right bar: time (`A`, `15`, `24`),
+  countdown (`A`, `3m`), or the crescent icon only
 - Optional crescent icon in the bar
 - Live next-prayer countdown and complete daily schedule
-- `now` at adhan time and `Nm ago` for the first 20 minutes afterward in the
-  two relative display modes
+- `now` at adhan time and `Nm ago` for the first 20 minutes afterward
 - Theme-native settings and panel UI
 
 ## Requirements
@@ -33,8 +33,9 @@ omarchy plugin add https://github.com/idr4n/omarchy-prayer-times.git --enable
 ```
 
 The installer prompts you to place the widget on the **left**, **center**, or
-**right** side of the bar. The attached panel opens below the selected
-position. You can move it later without reinstalling:
+**right** side of the bar; on a left or right bar these sections are the top,
+middle, and bottom. The attached panel opens from the bar beside the widget.
+You can move it later without reinstalling:
 
 ```sh
 omarchy bar move io.github.idr4n.prayer-times --section left
@@ -47,7 +48,7 @@ omarchy bar move io.github.idr4n.prayer-times --section right
 | Input | Action |
 | --- | --- |
 | Left click | Open or close the daily prayer panel |
-| Right click | Cycle through the four bar text formats and save the choice |
+| Right click | Cycle through the bar text formats and save the choice; on a left or right bar, cycle the stacked formats |
 | Middle click | Refresh prayer data |
 | Settings button, `S`, `,`, or `Ctrl+,` | Open or close settings |
 | `R` | Refresh prayer data while the panel is open |
@@ -65,12 +66,15 @@ searchable manual city and configure:
 - Hijri date adjustment from -2 to +2 days;
 - minute offsets from -15 to +15 for Fajr, Sunrise, Dhuhr, Asr, Maghrib, and
   Isha;
-- bar text format; and
+- bar text format, separately for top or bottom and left or right bars; and
 - crescent icon visibility.
 
-Absolute formats always show clock time. Relative formats count down to the
-next prayer, show `now` at adhan, and show elapsed minutes for 20 minutes after
-adhan before advancing to the next prayer.
+Time formats show the next prayer's clock time and relative formats count
+down to it. Every text format shows `now` at adhan and elapsed minutes for 20
+minutes after adhan before advancing to the next prayer. On a left or right bar
+the text stacks one short row per line, and the tooltip carries the full
+status. Until you pick a left or right bar format, it follows the top or bottom
+choice: countdown for a relative format, time otherwise.
 
 ## Network access and stored data
 
@@ -135,7 +139,8 @@ outside-click dismissal, and closing from settings against the live shell.
 
 Before release, also exercise automatic and manual locations, every bar text
 format, settings persistence, offline cache fallback, shell restart, and all
-three bar placements against a current Omarchy Quattro installation.
+three bar placements on both a top and a left or right bar against a current
+Omarchy Quattro installation.
 
 ## Data sources
 

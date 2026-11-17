@@ -20,6 +20,7 @@ FocusScope {
     || schoolPicker.popupOpen
     || highLatitudePicker.popupOpen
     || textModePicker.popupOpen
+    || verticalTextModePicker.popupOpen
 
   function locationDisplayName(entry) {
     if (!entry) return ""
@@ -279,7 +280,7 @@ FocusScope {
       Dropdown {
         id: textModePicker
         width: parent.width
-        label: "Text"
+        label: "Text (top or bottom bar)"
         foreground: root.foreground
         fontFamily: root.fontFamily
         options: root.prayer ? root.prayer.textModeOptions : []
@@ -289,10 +290,23 @@ FocusScope {
         }
       }
 
+      Dropdown {
+        id: verticalTextModePicker
+        width: parent.width
+        label: "Text (left or right bar)"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        options: root.prayer ? root.prayer.verticalTextModeOptions : []
+        value: root.prayer ? root.prayer.verticalTextMode : "time"
+        onChanged: function(value) {
+          if (root.prayer) root.prayer.updateSettings({ verticalTextMode: value }, false)
+        }
+      }
+
       Toggle {
         width: parent.width
         label: "Show crescent icon"
-        description: "Place the prayer icon before the selected text."
+        description: "Place the prayer icon before the selected text, or above it on a left or right bar."
         foreground: root.foreground
         fontFamily: root.fontFamily
         checked: root.prayer ? root.prayer.showIcon : false
