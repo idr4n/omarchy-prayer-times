@@ -3,6 +3,7 @@
 var PRE = 900
 var FLASH = 420
 var ELAPSED = 1200
+var WAKE_GAP_MS = 120000
 
 var TEXT_MODES = ["full-time", "full-relative", "initial-time", "initial-relative"]
 var OFFSET_KEYS = ["fajr", "sunrise", "dhuhr", "asr", "maghrib", "isha"]
@@ -51,6 +52,13 @@ var TEXT_MODE_OPTIONS = [
   { value: "initial-time", label: "A 15:24" },
   { value: "initial-relative", label: "A in 3m" }
 ]
+
+function clockJumped(previousMs, nowMs) {
+  if (typeof previousMs !== "number" || !isFinite(previousMs) || previousMs <= 0) return false
+  if (typeof nowMs !== "number" || !isFinite(nowMs)) return false
+  var delta = nowMs - previousMs
+  return delta > WAKE_GAP_MS || delta < -WAKE_GAP_MS
+}
 
 function parseMs(iso) {
   if (!iso) return NaN

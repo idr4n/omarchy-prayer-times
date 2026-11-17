@@ -41,6 +41,8 @@ Scope {
   property bool loaded: false
   property bool refreshing: false
   property bool refreshQueued: false
+  property bool locationRefreshRequested: false
+  property real previousTickMs: 0
   property bool settingsReady: false
   property bool settingsSaving: false
   property string settingsError: ""
@@ -199,14 +201,20 @@ Scope {
     Qt.callLater(root.refresh)
   }
 
-  function refresh() {
+  function refresh(forceLocation) {
+    if (forceLocation === true) root.locationRefreshRequested = true
     if (!root.settingsReady) return
     if (root.refreshing) {
       root.refreshQueued = true
       return
     }
     root.refreshing = true
-    prayerProcess.exec(root.backendArguments())
+    var args = root.backendArguments()
+    if (root.locationRefreshRequested && root.configuration.locationMode !== "manual") {
+      args.push("--refresh-location")
+      root.locationRefreshRequested = false
+    }
+    prayerProcess.exec(args)
   }
 
   function updateSettings(partial, refetch) {
@@ -236,6 +244,7 @@ Scope {
   }
 
   function useAutomaticLocation() {
+    root.locationRefreshRequested = true
     root.updateSettings({
       locationMode: "auto",
       locationName: "",
@@ -282,20 +291,27 @@ Scope {
     running: true
     triggeredOnStart: true
     onTriggered: {
+      var nowMs = Date.now()
+      var woke = PrayerLogic.clockJumped(root.previousTickMs, nowMs)
+      root.previousTickMs = nowMs
       root.recompute()
       var expiry = Date.parse(root.dateEndsAt)
       if (!root.refreshing
           && isFinite(expiry)
-          && Date.now() >= expiry
+          && nowMs >= expiry
           && root.rolloverRefreshAttempted !== root.dateEndsAt) {
         root.rolloverRefreshAttempted = root.dateEndsAt
+        root.refresh()
+      } else if (woke) {
+        // Timers use a monotonic clock that stops during suspend; a wall-clock
+        // jump means we likely woke up, possibly somewhere else.
         root.refresh()
       }
     }
   }
 
   Timer {
-    interval: 6 * 60 * 60 * 1000
+    interval: 60 * 60 * 1000
     repeat: true
     running: true
     onTriggered: root.refresh()

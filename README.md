@@ -81,11 +81,16 @@ HTTPS requests to:
 - `api.aladhan.com` for prayer times; and
 - `geocoding-api.open-meteo.com` only when you search for a manual city.
 
-Automatic location data is cached for 30 days. Prayer responses are cached for
-offline use. Settings are written atomically with mode `0600` and are never
-sent anywhere except as calculation parameters to AlAdhan.
+Automatic location is re-detected at startup, hourly, after the computer wakes
+from sleep, when you switch back to automatic, and when you refresh manually
+(middle click, or `R` or Enter in the panel). The last detected location and
+prayer responses are kept for offline use. Settings are written atomically
+with mode `0600` and are never sent anywhere except as calculation parameters
+to AlAdhan.
 
-IP geolocation is approximate. Use manual city search when an ISP or VPN
+IP geolocation is approximate. Mobile roaming and travel eSIMs often route
+traffic through another country, as do VPNs, so the detected city can be far
+from where you are. Use manual city search when an ISP, roaming carrier, or VPN
 endpoint is mapped somewhere else.
 
 Stored files:

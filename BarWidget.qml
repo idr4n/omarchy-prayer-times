@@ -84,7 +84,7 @@ BarWidget {
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.LeftButton) root.togglePanel()
       else if (buttonCode === Qt.RightButton) root.cycleTextMode()
-      else if (buttonCode === Qt.MiddleButton) prayer.refresh()
+      else if (buttonCode === Qt.MiddleButton) prayer.refresh(true)
     }
   }
 }

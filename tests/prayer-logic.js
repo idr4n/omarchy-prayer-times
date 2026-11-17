@@ -159,4 +159,12 @@ const invalidManualLocation = context.sanitizeSettings({
 });
 assert.equal(invalidManualLocation.locationMode, "auto");
 
+const tickMs = Date.parse("2026-11-17T12:00:00Z");
+assert.equal(context.clockJumped(0, tickMs), false);
+assert.equal(context.clockJumped(undefined, tickMs), false);
+assert.equal(context.clockJumped(NaN, tickMs), false);
+assert.equal(context.clockJumped(tickMs, tickMs + 1000), false);
+assert.equal(context.clockJumped(tickMs, tickMs + 3 * 60 * 1000), true);
+assert.equal(context.clockJumped(tickMs, tickMs - 60 * 60 * 1000), true);
+
 console.log("prayer logic: ok");

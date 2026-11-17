@@ -9,13 +9,14 @@ import runpy
 import stat
 import tempfile
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKEND = REPO_ROOT / "prayer-times-json"
+LOCATION_NOW = datetime(2026, 11, 17, 12, 0, tzinfo=timezone.utc)
 
 
 def aladhan_payload(*, hijri_month: int = 9) -> dict[str, object]:
@@ -308,6 +309,125 @@ class PrayerTimesBackendTest(unittest.TestCase):
             )
 
         self.assertIsNone(result)
+
+    def write_location_cache(
+        self, cache_dir: Path, label: str, age: timedelta
+    ) -> Path:
+        path = cache_dir / "location.json"
+        path.write_text(json.dumps({
+            "provider": self.module["LOCATION_PROVIDER"],
+            "latitude": 24.6877293,
+            "longitude": 46.7218526,
+            "locationLabel": label,
+            "timezone": "Asia/Riyadh",
+        }))
+        stamp = (LOCATION_NOW - age).timestamp()
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def resolve_with_fake_curl(
+        self, cache_dir: Path, *extra: str, fail: bool = False
+    ) -> tuple[dict[str, object] | None, list[str]]:
+        requests: list[str] = []
+        response = json.dumps({
+            "success": True,
+            "city": "Istanbul",
+            "country": "Turkey",
+            "latitude": 41.0082,
+            "longitude": 28.9784,
+            "timezone": {"id": "Europe/Istanbul"},
+        })
+
+        def fake_curl(url: str, *, ipv4: bool = False) -> str:
+            requests.append(url)
+            if fail:
+                raise RuntimeError("network unreachable")
+            return response
+
+        fetch_globals = self.module["fetch_geo_location"].__globals__
+        original = fetch_globals["curl_text"]
+        fetch_globals["curl_text"] = fake_curl
+        try:
+            result = self.module["resolve_location"](
+                self.args("--cache-dir", str(cache_dir), *extra),
+                cache_dir,
+                LOCATION_NOW,
+            )
+        finally:
+            fetch_globals["curl_text"] = original
+        return result, requests
+
+    def test_recent_location_cache_is_reused_without_network(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="prayer-location-") as directory:
+            cache_dir = Path(directory)
+            self.write_location_cache(cache_dir, "Riyadh, Saudi Arabia", timedelta(minutes=5))
+
+            result, requests = self.resolve_with_fake_curl(cache_dir)
+
+        self.assertEqual(result["locationLabel"], "Riyadh, Saudi Arabia")
+        self.assertEqual(requests, [])
+
+    def test_location_cache_older_than_reuse_window_is_redetected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="prayer-location-") as directory:
+            cache_dir = Path(directory)
+            self.write_location_cache(cache_dir, "Riyadh, Saudi Arabia", timedelta(minutes=16))
+
+            result, requests = self.resolve_with_fake_curl(cache_dir)
+            cached = json.loads((cache_dir / "location.json").read_text())
+
+        self.assertEqual(result["locationLabel"], "Istanbul, Turkey")
+        self.assertEqual(cached["locationLabel"], "Istanbul, Turkey")
+        self.assertEqual(requests, [self.module["LOCATION_URL"]])
+
+    def test_refresh_location_bypasses_recent_cache(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="prayer-location-") as directory:
+            cache_dir = Path(directory)
+            self.write_location_cache(cache_dir, "Riyadh, Saudi Arabia", timedelta(minutes=1))
+
+            result, requests = self.resolve_with_fake_curl(cache_dir, "--refresh-location")
+
+        self.assertEqual(result["locationLabel"], "Istanbul, Turkey")
+        self.assertEqual(len(requests), 1)
+
+    def test_failed_lookup_falls_back_to_old_cache_without_touching_it(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="prayer-location-") as directory:
+            cache_dir = Path(directory)
+            path = self.write_location_cache(cache_dir, "Riyadh, Saudi Arabia", timedelta(days=40))
+            before = path.stat().st_mtime
+
+            result, requests = self.resolve_with_fake_curl(
+                cache_dir, "--refresh-location", fail=True
+            )
+            after = path.stat().st_mtime
+
+        self.assertEqual(result["locationLabel"], "Riyadh, Saudi Arabia")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(before, after)
+
+    def test_no_network_uses_old_cache_without_lookup(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="prayer-location-") as directory:
+            cache_dir = Path(directory)
+            self.write_location_cache(cache_dir, "Riyadh, Saudi Arabia", timedelta(days=40))
+
+            result, requests = self.resolve_with_fake_curl(cache_dir, "--no-network")
+
+        self.assertEqual(result["locationLabel"], "Riyadh, Saudi Arabia")
+        self.assertEqual(requests, [])
+
+    def test_future_dated_location_cache_is_not_fresh(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="prayer-location-") as directory:
+            cache_dir = Path(directory)
+            self.write_location_cache(cache_dir, "Riyadh, Saudi Arabia", timedelta(days=-1))
+
+            self.assertIsNone(
+                self.module["cached_location"](
+                    cache_dir, LOCATION_NOW, self.module["LOCATION_REUSE_WINDOW"]
+                )
+            )
+            result, requests = self.resolve_with_fake_curl(cache_dir)
+
+        self.assertEqual(result["locationLabel"], "Istanbul, Turkey")
+        self.assertEqual(len(requests), 1)
 
 
 if __name__ == "__main__":

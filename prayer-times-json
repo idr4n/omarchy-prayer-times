@@ -25,7 +25,7 @@ DEFAULT_METHOD = 4
 DEFAULT_SCHOOL = 0
 MAX_SETTINGS_BYTES = 64 * 1024
 POST_ADHAN_MINUTES = 20
-LOCATION_MAX_AGE = dt.timedelta(days=30)
+LOCATION_REUSE_WINDOW = dt.timedelta(minutes=15)
 ALADHAN_BASE_URL = "https://api.aladhan.com/v1/timings"
 LOCATION_PROVIDER = "ipwho-v4"
 LOCATION_URL = "https://ipwho.is/?fields=success,city,country,latitude,longitude,timezone"
@@ -122,6 +122,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--now")
     parser.add_argument("--tz")
     parser.add_argument("--no-network", action="store_true")
+    parser.add_argument("--refresh-location", action="store_true")
     parser.add_argument("--cache-dir", default=str(default_cache_dir()))
     parser.add_argument("--read-settings", action="store_true")
     parser.add_argument("--write-settings")
@@ -379,7 +380,9 @@ def error_payload(
     }
 
 
-def cached_location(cache_dir: Path, now: dt.datetime) -> dict[str, Any] | None:
+def cached_location(
+    cache_dir: Path, now: dt.datetime, max_age: dt.timedelta | None = None
+) -> dict[str, Any] | None:
     path = cache_dir / "location.json"
     payload = read_json_file(path)
     if not payload:
@@ -392,7 +395,7 @@ def cached_location(cache_dir: Path, now: dt.datetime) -> dict[str, Any] | None:
         longitude = float(payload["longitude"])
     except (OSError, KeyError, TypeError, ValueError):
         return None
-    if now - modified >= LOCATION_MAX_AGE:
+    if max_age is not None and not (dt.timedelta(0) <= now - modified < max_age):
         return None
     label = str(payload.get("locationLabel") or f"{coord_key(latitude)}, {coord_key(longitude)}").strip()
     return {
@@ -465,10 +468,15 @@ def resolve_location(
             "locationLabel": str(args.location_label or f"{coord_key(latitude)}, {coord_key(longitude)}").strip(),
             "timezone": str(args.tz or "").strip(),
         }
-    location = cached_location(cache_dir, now)
-    if location:
-        return location
-    return fetch_geo_location(cache_dir, now) if not args.no_network else None
+    if not args.refresh_location:
+        location = cached_location(cache_dir, now, LOCATION_REUSE_WINDOW)
+        if location:
+            return location
+    if not args.no_network:
+        location = fetch_geo_location(cache_dir, now)
+        if location:
+            return location
+    return cached_location(cache_dir, now)
 
 
 def normalize_time(value: Any) -> str:

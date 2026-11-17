@@ -66,7 +66,7 @@ Panel {
   }
 
   function refresh() {
-    if (root.prayer) root.prayer.refresh()
+    if (root.prayer) root.prayer.refresh(true)
   }
 
   function formatCountdown(seconds) {
