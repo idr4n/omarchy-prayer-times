@@ -156,7 +156,8 @@ Panel {
       onActivateRequested: if (!root.showSettings) root.refresh()
       onTextKey: function(text) {
         if (text === "r" || text === "R") root.refresh()
-        else if (text === "s" || text === "S") root.showSettings = !root.showSettings
+        // "," also covers Ctrl+, since the control transform leaves "," as-is.
+        else if (text === "s" || text === "S" || text === ",") root.showSettings = !root.showSettings
       }
 
       Column {

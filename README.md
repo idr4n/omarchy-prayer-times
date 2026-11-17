@@ -49,7 +49,7 @@ omarchy bar move io.github.idr4n.prayer-times --section right
 | Left click | Open or close the daily prayer panel |
 | Right click | Cycle through the four bar text formats and save the choice |
 | Middle click | Refresh prayer data |
-| Settings button or `S` | Open or close settings |
+| Settings button, `S`, `,`, or `Ctrl+,` | Open or close settings |
 | `R` | Refresh prayer data while the panel is open |
 | `Escape` | Return from settings, then close the panel |
 
